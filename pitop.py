@@ -324,6 +324,9 @@ class PitopRobot():
             target_distance = 19  # Target distance in cm (19 cm)
             alignment_threshold = 10  # Angle threshold (in degrees) to start aligning
 
+            self.pan_servo_to_angle(self.claw_servo, initial_claw_angle)
+            self.pan_servo_to_angle(self.camera_servo, initial_camera_angle)
+
             while self.running:
                 frame = self.pitop.camera.get_frame()
                 if frame is None:
