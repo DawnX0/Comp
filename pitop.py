@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 import os
 from collections import deque
+import QLearningAgent
 
 
 class RemoteControls():
@@ -33,6 +34,7 @@ class PitopRobot():
         camera_servo_port: str = "S1",
         navigation_method: Literal["remote", "autonomous"] = "autonomous",
         ordinance_template: str | None = None,
+        **kwargs
     ):
         self.pitop = Pitop()
         self.pitop.add_component(
@@ -48,6 +50,8 @@ class PitopRobot():
         self.drive_history: list[Tuple[str, int, int | None]] = []
         self.running = False
         self.distance_history = deque(maxlen=10)
+        self.agent = QLearningAgent(actions=["forward", "left", "right", "stop"])  # Q-learning agent
+        super().__init__(**kwargs)
 
         self.__run__()
 
@@ -61,25 +65,21 @@ class PitopRobot():
         servo.tilt_servo.target_angle = angle
 
     
-    def drive(
-        self, 
-        direction: Literal["forward", "backward", "left", "right", "stop"],
-        distance: int | None,
-        hold: bool = False,
-        speed: int = 0.5,
-        duration: int = 0
-    ):
-        self.drive_history.append((direction, hold, distance, duration))
+    def drive(self, direction: Literal["forward", "backward", "left", "right", "stop"],
+            distance: int | None = None,
+            hold: bool = False,
+            speed: int = 0.5,
+            duration: int = 0):
+        
+        if direction not in {"forward", "backward", "left", "right", "stop"}:
+            raise ValueError(f"Invalid drive direction: {direction}")
 
-        if direction == "forward":
-            self.pitop.drive.forward(speed, hold, distance)
-        elif direction == "backward":
-            self.pitop.drive.backward(speed, hold, distance)
-        elif direction == "left":
-            self.pitop.drive.left(speed, hold, distance)
-        elif direction == "right":
-            self.pitop.drive.right(speed, hold, distance)
-        elif direction == "stop":
+        self.drive_history.append((direction, distance, hold, duration))
+
+        drive_command = getattr(self.pitop.drive, direction, None)
+        if drive_command:
+            drive_command(speed, hold, distance)
+        else:
             self.pitop.drive.stop()
 
 
@@ -242,6 +242,10 @@ class PitopRobot():
             # Find contours on the thresholded mask
             contours, _ = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
 
+            if not contours or len(contours) < 2:
+                print("Not enough contours found for ordinance detection.")
+                return None
+
             # Sort contours by area (largest first)
             sorted_contours = sorted(contours, key=cv2.contourArea, reverse=True)
 
@@ -293,27 +297,18 @@ class PitopRobot():
             KNOWN_WIDTH = ordinance_width
             FOCAL_LENGTH = 420
 
-            # Check if bbox_width is within a reasonable range to avoid errors
-            if bbox_width < 10:  # Too small, return None or ignore
-                print("Bounding box is too small, skipping distance calculation.")
-                return None
-            elif bbox_width > 500:  # Too large, return None or ignore
-                print("Bounding box is too large, skipping distance calculation.")
+            if bbox_width < 10 or bbox_width > 500:
+                print(f"Invalid bbox width ({bbox_width}), skipping distance calculation.")
                 return None
 
-            # Calculate the distance using the formula
             distance = (KNOWN_WIDTH * FOCAL_LENGTH) / bbox_width
 
-            # Define a valid distance range (e.g., between 20cm and 500cm)
             if distance < 15 or distance > 40:
-                print(f"Calculated distance {distance} is out of range, skipping.")
+                print(f"Distance {distance} cm out of range. Ignoring measurement.")
                 return None
 
-            # Store the distance and calculate moving average
             self.distance_history.append(distance)
-            smoothed_distance = sum(self.distance_history) / len(self.distance_history)
-
-            return smoothed_distance
+            return sum(self.distance_history) / len(self.distance_history)
             
         try:
             # Initial Setup
@@ -332,51 +327,44 @@ class PitopRobot():
                 if frame is None:
                     continue
 
-                # 1. Detect the line and ordinance
-                line_centroid, line_angle, line_bbox_width = detect_line(frame)
-                ordinance_centroid, ordinance_angle, ordinance_bbox_width = detect_ordinance(frame)
-                
-                # If no ordinance is detected, continue scanning
+                # Get sensor readings
+                line_centroid, line_angle, _ = self.detect_line(frame)
+                ordinance_centroid, ordinance_angle, ordinance_bbox_width = self.detect_ordinance(frame)
+
                 if ordinance_centroid is None:
-                    print("No ordinance detected, continuing scan.")
-                else:
-                    # Estimate the distance to the ordinance
-                    ordinance_distance = estimate_distance_to_ordinance(ordinance_width, ordinance_bbox_width)
+                    continue  # Skip loop if no ordinance detected
 
-                    # If the distance is invalid, skip this loop
-                    if ordinance_distance is None:
-                        continue
+                # Estimate distance
+                ordinance_distance = self.estimate_distance_to_ordinance(5.0, ordinance_bbox_width)
+                if ordinance_distance is None:
+                    continue
 
-                    print(f"Ordinance detected at distance: {ordinance_distance} cm.")
+                distance_error = ordinance_distance - target_distance
+                state = self.get_state(line_angle, ordinance_angle, ordinance_distance)
 
-                    # 2. Adjust movement based on the distance to the ordinance
-                    distance_error = ordinance_distance - target_distance
+                # Choose action based on learned Q-values
+                action = self.agent.choose_action(state)
 
-                    # 3. Adjust robot orientation based on the ordinance angle
-                    if abs(ordinance_angle) > alignment_threshold:
-                        print(f"Adjusting orientation to ordinance. Current angle: {ordinance_angle}")
-                        self.drive("stop", distance=None, speed=0)  # Stop moving temporarily for adjustment
-                        self.pitop.drive.target_lock_drive_angle(ordinance_angle)  # Rotate to align with ordinance
-                        continue  # Skip further movement while aligning
+                # Execute the action
+                if action == "forward":
+                    self.drive("forward", speed=0.5, hold=True)
+                elif action == "left":
+                    self.drive("left", speed=0.5, hold=False)
+                elif action == "right":
+                    self.drive("right", speed=0.5, hold=False)
+                elif action == "stop":
+                    self.drive("stop")
 
-                    # 4. Line-following logic: adjust robot heading based on the line angle
-                    if line_centroid is not None and abs(line_angle) > 5:  # If line is detected and the angle is significant
-                        print(f"Adjusting orientation to stay on the line. Line angle: {line_angle}")
-                        self.drive("stop", distance=None, speed=0)  # Stop temporarily to adjust
-                        self.pitop.drive.target_lock_drive_angle(line_angle)  # Adjust to stay aligned with the line
+                # Compute the reward
+                reward = self.compute_reward(distance_error, line_angle, ordinance_angle)
 
-                    # 5. Adjust movement based on distance error to the ordinance
-                    if distance_error > 0:
-                        print(f"Too far from ordinance, moving forward. Distance error: {distance_error} cm.")
-                        self.drive("forward", distance=None, speed=0.5)
+                # Get the new state after taking the action
+                new_state = self.get_state(line_angle, ordinance_angle, ordinance_distance)
 
-                    elif distance_error < 0:
-                        print(f"Too close to ordinance, stopping. Distance error: {distance_error} cm.")
-                        self.drive("stop", distance=None, speed=0)  # Or move backward slightly if needed
+                # Update Q-table
+                self.agent.update_q_value(state, action, reward, new_state)
 
-                    else:
-                        print("At the desired distance of 19 cm.")
-                        self.drive("stop", distance=None, speed=0)  # Stay still
+                time.sleep(0.1)
 
         except KeyboardInterrupt:
             self.running = False
