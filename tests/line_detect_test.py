@@ -1,6 +1,6 @@
 from signal import pause
 
-from pitop import Camera, DriveController, Pitop
+from PitopRobot import Camera, DriveController, Pitop
 # from vendor.line_detect import process_frame_for_line
 from pitop.processing.algorithms.line_detect import process_frame_for_line
 

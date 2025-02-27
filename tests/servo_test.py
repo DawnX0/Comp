@@ -1,4 +1,4 @@
-from pitop import Pitop, PanTiltController
+from PitopRobot import Pitop, PanTiltController
 from time import sleep
 from signal import pause
 

@@ -1,4 +1,4 @@
-from pitop import Pitop, Camera
+from PitopRobot import Pitop, Camera
 
 robot = Pitop()
 robot.add_component(Camera(format="OpenCV", rotate_angle=90))

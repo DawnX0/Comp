@@ -1,7 +1,7 @@
 import cv2
 import time
 import numpy as np
-from pitop import Pitop, UltrasonicSensor, Camera, PanTiltController
+from PitopRobot import Pitop, UltrasonicSensor, Camera, PanTiltController
 from vendor.drive_controller import DriveController
 from vendor.line_detect import process_frame_for_line
 

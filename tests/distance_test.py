@@ -1,4 +1,4 @@
-from pitop import Pitop, Camera, PanTiltController
+from PitopRobot import Pitop, Camera, PanTiltController
 import cv2
 import os
 import time

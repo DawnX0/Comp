@@ -11,7 +11,6 @@ import cv2
 import numpy as np
 import os
 from collections import deque
-import QLearningAgent
 
 
 class RemoteControls():
@@ -33,8 +32,7 @@ class PitopRobot():
         claw_servo_port: str = "S2",
         camera_servo_port: str = "S1",
         navigation_method: Literal["remote", "autonomous"] = "autonomous",
-        ordinance_template: str | None = None,
-        **kwargs
+        ordinance_template: str | None = "ordinance_template.png",
     ):
         self.pitop = Pitop()
         self.pitop.add_component(
@@ -50,10 +48,8 @@ class PitopRobot():
         self.drive_history: list[Tuple[str, int, int | None]] = []
         self.running = False
         self.distance_history = deque(maxlen=10)
-        self.agent = QLearningAgent(actions=["forward", "left", "right", "stop"])  # Q-learning agent
-        super().__init__(**kwargs)
-
         self.__run__()
+        
 
     def pan_servo_to_angle(self, servo: PanTiltController, angle: int = 0):
         servo.pan_servo.target_speed = 100
@@ -77,7 +73,7 @@ class PitopRobot():
         self.drive_history.append((direction, distance, hold, duration))
 
         drive_command = getattr(self.pitop.drive, direction, None)
-        if drive_command:
+        if drive_command and direction != "stop":
             drive_command(speed, hold, distance)
         else:
             self.pitop.drive.stop()
@@ -111,23 +107,21 @@ class PitopRobot():
 
         
         def pan_claw(angle: int):
-            target_claw_angle += angle
-            self.pan_servo_to_angle(self.claw_servo, target_claw_angle)
+            self.pan_servo_to_angle(self.claw_servo, self.claw_servo.pan_servo.current_angle + angle)
 
 
         def pan_camera(angle: int):
-            target_camera_angle += angle
-            self.pan_servo_to_angle(self.camera_servo, target_camera_angle)
+            self.pan_servo_to_angle(self.camera_servo, self.camera_servo.pan_servo.current_angle + angle)
 
         control_map = {
             RemoteControls.FORWARD: lambda: self.drive("forward", hold=True, speed=1),
             RemoteControls.BACKWARD: lambda: self.drive("backward", hold=True, speed=1),
             RemoteControls.LEFT: lambda: self.drive("left", hold=False, speed=1),
             RemoteControls.RIGHT: lambda: self.drive("right", hold=False, speed=1),
-            RemoteControls.CLAW_SERVO_UP: lambda: pan_claw(1),
-            RemoteControls.CLAW_SERVO_DOWN: lambda: pan_claw(-1),
-            RemoteControls.CAMERA_SERVO_UP: lambda: pan_camera(1),
-            RemoteControls.CAMERA_SERVO_DOWN: lambda: pan_camera(-1),
+            RemoteControls.CLAW_SERVO_UP: lambda: pan_claw(3),
+            RemoteControls.CLAW_SERVO_DOWN: lambda: pan_claw(-3),
+            RemoteControls.CAMERA_SERVO_UP: lambda: pan_camera(3),
+            RemoteControls.CAMERA_SERVO_DOWN: lambda: pan_camera(-3),
             RemoteControls.QUIT: exit_loop,
         }
 
@@ -138,7 +132,8 @@ class PitopRobot():
             for key, button in buttons.items():
                 if button.is_pressed:
                     if key not in pressed_keys:
-                        pressed_keys.add(key)
+                        if key not in("e", "f", "r", "g"):
+                            pressed_keys.add(key)
                         control_map[key]()
                 else:
                     if key in pressed_keys:
@@ -150,15 +145,15 @@ class PitopRobot():
 
     def autonomous_navigation(self):
         # Line HSV ranges
-        lower_line_hsv = [120, 255, 255]
-        upper_line_hsv = [100, 255, 255]
+        lower_line_hsv = np.array([120, 255, 255])
+        upper_line_hsv = np.array([100, 255, 255])
 
         # Ordinance HSV ranges
-        lower_ordinance_hsv = [179, 255, 255]
-        upper_ordinance_hsv = [179, 255, 127]
+        lower_ordinance_hsv = np.array([179, 255, 255])
+        upper_ordinance_hsv = np.array([179, 255, 127])
 
         # Frame size
-        resolution = (640, 480)
+        frame_resolution = (640, 480)
 
         # Check for ordinance template
         resized_template_name = "resized_template.png"
@@ -169,13 +164,13 @@ class PitopRobot():
         else:
             if os.path.isfile(self.ordinance_template) is not None:
                 template = cv2.imread(self.ordinance_template)
-                resized_template = cv2.resize(template, resolution)
+                resized_template = cv2.resize(template, frame_resolution)
 
                 # Save the resized image if needed
                 cv2.imwrite(resized_template_name.lower(), resized_template)
 
         # Add camera
-        self.pitop.add_component(Camera(format="OpenCV"), rotate_angle=90, frame_resolution=resolution)
+        self.pitop.add_component(Camera(format="OpenCV", rotate_angle=90, resolution=frame_resolution))
 
         def detect_line(frame):
             # Apply Gaussian blur to smooth the frame
@@ -183,13 +178,10 @@ class PitopRobot():
 
             # Convert BGR to HSV
             hsv_frame = cv2.cvtColor(blurred_frame, cv2.COLOR_BGR2HSV)
-
+            
             # Threshold the HSV image to get only the target color
             mask = cv2.inRange(hsv_frame, lower_line_hsv, upper_line_hsv)
-
-            # Apply Canny edge detection on the mask (not the original frame)
-            edges = cv2.Canny(mask, 50, 150)
-
+            
             # Find contours on the mask
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -203,7 +195,7 @@ class PitopRobot():
                     angle = get_object_target_lock_control_angle(centroid, frame)
                     x, y, w, h = cv2.boundingRect(largest_contour)
 
-                    return repositioned_centroid, angle, w
+                    return repositioned_centroid, angle
 
             return None, None
 
@@ -241,10 +233,10 @@ class PitopRobot():
 
             # Find contours on the thresholded mask
             contours, _ = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-
+            
             if not contours or len(contours) < 2:
                 print("Not enough contours found for ordinance detection.")
-                return None
+                return None, None, None
 
             # Sort contours by area (largest first)
             sorted_contours = sorted(contours, key=cv2.contourArea, reverse=True)
@@ -327,44 +319,51 @@ class PitopRobot():
                 if frame is None:
                     continue
 
-                # Get sensor readings
-                line_centroid, line_angle, _ = self.detect_line(frame)
-                ordinance_centroid, ordinance_angle, ordinance_bbox_width = self.detect_ordinance(frame)
+                # 1. Detect the line and ordinance
+                line_centroid, line_angle = detect_line(frame)
+                ordinance_centroid, ordinance_angle, ordinance_bbox_width = detect_ordinance(frame)
 
+                # If no ordinance is detected, continue scanning
                 if ordinance_centroid is None:
-                    continue  # Skip loop if no ordinance detected
+                    print("No ordinance detected, continuing scan.")
+                else:
+                    # Estimate the distance to the ordinance
+                    ordinance_distance = estimate_distance_to_ordinance(ordinance_width, ordinance_bbox_width)
 
-                # Estimate distance
-                ordinance_distance = self.estimate_distance_to_ordinance(5.0, ordinance_bbox_width)
-                if ordinance_distance is None:
-                    continue
+                    # If the distance is invalid, skip this loop
+                    if ordinance_distance is None:
+                        continue
 
-                distance_error = ordinance_distance - target_distance
-                state = self.get_state(line_angle, ordinance_angle, ordinance_distance)
+                    print(f"Ordinance detected at distance: {ordinance_distance} cm.")
 
-                # Choose action based on learned Q-values
-                action = self.agent.choose_action(state)
+                    # 2. Adjust movement based on the distance to the ordinance
+                    distance_error = ordinance_distance - target_distance
 
-                # Execute the action
-                if action == "forward":
-                    self.drive("forward", speed=0.5, hold=True)
-                elif action == "left":
-                    self.drive("left", speed=0.5, hold=False)
-                elif action == "right":
-                    self.drive("right", speed=0.5, hold=False)
-                elif action == "stop":
-                    self.drive("stop")
+                    # 3. Adjust robot orientation based on the ordinance angle
+                    if abs(ordinance_angle) > alignment_threshold:
+                        print(f"Adjusting orientation to ordinance. Current angle: {ordinance_angle}")
+                        self.drive("stop", distance=None, speed=0)  # Stop moving temporarily for adjustment
+                        self.pitop.drive.target_lock_drive_angle(ordinance_angle)  # Rotate to align with ordinance
+                        continue  # Skip further movement while aligning
 
-                # Compute the reward
-                reward = self.compute_reward(distance_error, line_angle, ordinance_angle)
+                    # 4. Line-following logic: adjust robot heading based on the line angle
+                    if line_centroid is not None and abs(line_angle) > 5:  # If line is detected and the angle is significant
+                        print(f"Adjusting orientation to stay on the line. Line angle: {line_angle}")
+                        self.drive("stop", distance=None, speed=0)  # Stop temporarily to adjust
+                        self.pitop.drive.target_lock_drive_angle(line_angle)  # Adjust to stay aligned with the line
 
-                # Get the new state after taking the action
-                new_state = self.get_state(line_angle, ordinance_angle, ordinance_distance)
+                    # 5. Adjust movement based on distance error to the ordinance
+                    if distance_error > 0:
+                        print(f"Too far from ordinance, moving forward. Distance error: {distance_error} cm.")
+                        self.drive("forward", distance=None, speed=0.5)
 
-                # Update Q-table
-                self.agent.update_q_value(state, action, reward, new_state)
+                    elif distance_error < 0:
+                        print(f"Too close to ordinance, stopping. Distance error: {distance_error} cm.")
+                        self.drive("stop", distance=None, speed=0)  # Or move backward slightly if needed
 
-                time.sleep(0.1)
+                    else:
+                        print("At the desired distance of 19 cm.")
+                        self.drive("stop", distance=None, speed=0)  # Stay still
 
         except KeyboardInterrupt:
             self.running = False

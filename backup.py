@@ -3,7 +3,7 @@ import cv2
 import numpy as np
 from time import sleep
 from collections import deque
-from pitop import Pitop, PanTiltController, Camera, UltrasonicSensor
+from PitopRobot import Pitop, PanTiltController, Camera, UltrasonicSensor
 from vendor.line_detect import process_frame_for_line
 from vendor.drive_controller import DriveController
 
