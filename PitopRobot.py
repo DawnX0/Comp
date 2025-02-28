@@ -5,6 +5,7 @@ from pitop.processing.core.vision_functions import (
     get_object_target_lock_control_angle
 )
 from vendor.drive_controller import DriveController
+from vendor.line_detect import process_frame_for_line
 from typing import Literal, Tuple
 import time
 import cv2
@@ -144,19 +145,23 @@ class PitopRobot():
 
 
     def autonomous_navigation(self):
-        # Line HSV ranges
-        lower_line_hsv = np.array([120, 255, 255])
-        upper_line_hsv = np.array([100, 255, 255])
+        # Ordinance HSV ranges (Hot pink)
+        lower_ordinance_hsv = np.array([140, 100, 100])
+        upper_ordinance_hsv = np.array([170, 255, 255])
+        
+        # Lower Red range for testing
+        lower_red1 = np.array([0, 100, 100])
+        upper_red1 = np.array([10, 255, 255])
 
-        # Ordinance HSV ranges
-        lower_ordinance_hsv = np.array([179, 255, 255])
-        upper_ordinance_hsv = np.array([179, 255, 127])
+        # Upper Red range
+        lower_red2 = np.array([160, 100, 100])
+        upper_red2 = np.array([179, 255, 255])
 
         # Frame size
         frame_resolution = (640, 480)
 
         # Check for ordinance template
-        resized_template_name = "resized_template.png"
+        resized_template_name = "resized_ordinance_template.png"
         resized_template = None
 
         if os.path.isfile(resized_template_name.lower()):
@@ -164,7 +169,7 @@ class PitopRobot():
         else:
             if os.path.isfile(self.ordinance_template) is not None:
                 template = cv2.imread(self.ordinance_template)
-                resized_template = cv2.resize(template, frame_resolution)
+                resized_template = cv2.resize(template, frame_resolution, interpolation=cv2.INTER_LINEAR) # Preserve transparency
 
                 # Save the resized image if needed
                 cv2.imwrite(resized_template_name.lower(), resized_template)
@@ -172,110 +177,43 @@ class PitopRobot():
         # Add camera
         self.pitop.add_component(Camera(format="OpenCV", rotate_angle=90, resolution=frame_resolution))
 
+
         def detect_line(frame):
-            # Apply Gaussian blur to smooth the frame
-            blurred_frame = cv2.GaussianBlur(frame, (9, 9), 0)
+            processed_frame = process_frame_for_line(frame)
 
-            # Convert BGR to HSV
-            hsv_frame = cv2.cvtColor(blurred_frame, cv2.COLOR_BGR2HSV)
-            
-            # Threshold the HSV image to get only the target color
-            mask = cv2.inRange(hsv_frame, lower_line_hsv, upper_line_hsv)
-            
-            # Find contours on the mask
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-            if contours:
-                # Get the largest contour
-                largest_contour = max(contours, key=cv2.contourArea)
-
-                if largest_contour is not None:
-                    centroid = find_centroid(largest_contour)
-                    repositioned_centroid = center_reposition(centroid, frame)
-                    angle = get_object_target_lock_control_angle(centroid, frame)
-                    x, y, w, h = cv2.boundingRect(largest_contour)
-
-                    return repositioned_centroid, angle
-
-            return None, None
-
-
-        def get_hu_moments(contour):
-            # Calculate moments for the contour
-            moments = cv2.moments(contour)
-            
-            # Calculate Hu Moments
-            hu_moments = cv2.HuMoments(moments).flatten()
-            
-            # Optional: Apply log transformation to make them more distinct
-            for i in range(0, 7):
-                if hu_moments[i] != 0:
-                    hu_moments[i] = -np.sign(hu_moments[i]) * np.log10(abs(hu_moments[i]))
-            
-            return hu_moments
-
-
-        def compare_hu_moments(hu_moments1, hu_moments2):
-            # Compare Hu Moments using a distance metric (e.g., Euclidean distance)
-            distance = np.linalg.norm(hu_moments1 - hu_moments2)
-            return distance
-
+            if processed_frame.line_center is not None:
+                self.pitop.miniscreen.display_image(processed_frame.robot_view)
+                return processed_frame.angle
+            else:
+                print("\n No line detected.", end="\r")
+                return None
+    
 
         def detect_ordinance(frame):
-            # Apply Gaussian blur to smooth the frame
-            blurred_frame = cv2.GaussianBlur(frame, (9, 9), 0)
-
             # Convert BGR to HSV
-            hsv_frame = cv2.cvtColor(blurred_frame, cv2.COLOR_BGR2HSV)
-
-            # Threshold the HSV image to get only the target color
-            mask = cv2.inRange(hsv_frame, lower_ordinance_hsv, upper_ordinance_hsv)
-
-            # Find contours on the thresholded mask
-            contours, _ = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+            hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
             
-            if not contours or len(contours) < 2:
-                print("Not enough contours found for ordinance detection.")
-                return None, None, None
+            # Apply Gaussian blur to smooth the frame
+            blurred_hsv = cv2.GaussianBlur(hsv_frame, (9, 9), 0)
+            
+            # Threshold to get the mask for the desired color
+            # mask = cv2.inRange(blurred_hsv, lower_ordinance_hsv, upper_ordinance_hsv)
 
-            # Sort contours by area (largest first)
-            sorted_contours = sorted(contours, key=cv2.contourArea, reverse=True)
+            # Create masks for both red ranges
+            mask1 = cv2.inRange(blurred_hsv, lower_red1, upper_red1)
+            mask2 = cv2.inRange(blurred_hsv, lower_red2, upper_red2)
 
-            # Ensure the first contour is the image outline by ignoring it
-            if len(sorted_contours) > 1:
-                # Extract the second largest contour (actual shape)
-                template_contour = sorted_contours[1]
+            # Combine masks
+            red_mask = cv2.bitwise_or(mask1, mask2)
+            
+            # Morphological operations to clean the mask
+            morph_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+            morph_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
 
-                # Compute the Hu Moments for the template contour
-                template_hu_moments = get_hu_moments(template_contour)
-
-                closest_contour = None
-                for c in sorted_contours[1:]:  # Skip the first contour (image outline)
-                    # Compute Hu Moments for the current contour
-                    hu_moments = get_hu_moments(c)
-
-                    # Compare the Hu Moments between the template and current contour
-                    distance = compare_hu_moments(template_hu_moments, hu_moments)
-                    print(f"Hu Moments distance: {distance}")
-
-                    # If distance is low (less than a threshold), consider it a valid match
-                    if distance < 0.15:  # Threshold can be adjusted
-                        closest_contour = c
-                        
-                        # Calculate centroid and angle of the matched contour
-                        centroid = find_centroid(closest_contour)
-                        repositioned_centroid = center_reposition(centroid, frame)
-                        angle = get_object_target_lock_control_angle(centroid, frame)
-                        x, y, w, h = cv2.boundingRect(closest_contour)
-
-                        # Return the matched centroid and angle
-                        return repositioned_centroid, angle, w
-                else:
-                    print("No valid match found.")
-                    return None
-            else:
-                print("Not enough contours found.")
-                return None
+            # Find contours
+            contours, _ = cv2.findContours(morph_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            self.pitop.miniscreen.display_image(contours)
                 
 
         def follow_angle(angle):
@@ -303,68 +241,62 @@ class PitopRobot():
             return sum(self.distance_history) / len(self.distance_history)
             
         try:
-            # Initial Setup
+            # Conditionals
             capturing_ordinance = False
-            initial_claw_angle = -45
-            initial_camera_angle = 12
-            ordinance_width = 5.0
-            target_distance = 19  # Target distance in cm (19 cm)
-            alignment_threshold = 10  # Angle threshold (in degrees) to start aligning
-
+            red_square_detected = False
+            
+            # Parameters
+            red_square_count = 0
+            initial_claw_angle = -45 # degrees
+            initial_camera_angle = 12 # degrees
+            ordinance_width = 5.0 # cm
+            target_distance = 19  # cm
+            
+            # Initial Setup
             self.pan_servo_to_angle(self.claw_servo, initial_claw_angle)
             self.pan_servo_to_angle(self.camera_servo, initial_camera_angle)
-
+            
+            """
+            Logic Process:
+            
+            1. Detect line
+            2. While detecting line, look for red squares
+                - Red squares will be what gives our robot a choice
+                to make a decision.
+            3. When the red square is detected look for ordinances based on
+                the location the judges specify.
+                - Use the red_squares_count to count squares in phase two, which allow
+                the robot to know where to drop off ordinances
+            
+            This is not the final logic process, there are still changes to be made
+            
+            """
+            
             while self.running:
                 frame = self.pitop.camera.get_frame()
                 if frame is None:
                     continue
 
-                # 1. Detect the line and ordinance
-                line_centroid, line_angle = detect_line(frame)
-                ordinance_centroid, ordinance_angle, ordinance_bbox_width = detect_ordinance(frame)
+                # 1. Detect the line and red squares
+                line_angle = detect_line(frame)
+                # TODO red square detection
+                
+                # 3. Line-following
+                if line_angle:  # If line is detected and the angle is significant
+                    pass
+                
+                # 4. TODO Red square detected
+                
+                ordinance_angle = detect_ordinance(frame)
 
-                # If no ordinance is detected, continue scanning
-                if ordinance_centroid is None:
-                    print("No ordinance detected, continuing scan.")
+                # 5. Ordinance logic
+                if ordinance_angle and not capturing_ordinance:
+                    print(f"Following line. Line angle: {line_angle}")
+                    follow_angle(line_angle)
+                    
                 else:
-                    # Estimate the distance to the ordinance
-                    ordinance_distance = estimate_distance_to_ordinance(ordinance_width, ordinance_bbox_width)
-
-                    # If the distance is invalid, skip this loop
-                    if ordinance_distance is None:
-                        continue
-
-                    print(f"Ordinance detected at distance: {ordinance_distance} cm.")
-
-                    # 2. Adjust movement based on the distance to the ordinance
-                    distance_error = ordinance_distance - target_distance
-
-                    # 3. Adjust robot orientation based on the ordinance angle
-                    if abs(ordinance_angle) > alignment_threshold:
-                        print(f"Adjusting orientation to ordinance. Current angle: {ordinance_angle}")
-                        self.drive("stop", distance=None, speed=0)  # Stop moving temporarily for adjustment
-                        self.pitop.drive.target_lock_drive_angle(ordinance_angle)  # Rotate to align with ordinance
-                        continue  # Skip further movement while aligning
-
-                    # 4. Line-following logic: adjust robot heading based on the line angle
-                    if line_centroid is not None and abs(line_angle) > 5:  # If line is detected and the angle is significant
-                        print(f"Adjusting orientation to stay on the line. Line angle: {line_angle}")
-                        self.drive("stop", distance=None, speed=0)  # Stop temporarily to adjust
-                        self.pitop.drive.target_lock_drive_angle(line_angle)  # Adjust to stay aligned with the line
-
-                    # 5. Adjust movement based on distance error to the ordinance
-                    if distance_error > 0:
-                        print(f"Too far from ordinance, moving forward. Distance error: {distance_error} cm.")
-                        self.drive("forward", distance=None, speed=0.5)
-
-                    elif distance_error < 0:
-                        print(f"Too close to ordinance, stopping. Distance error: {distance_error} cm.")
-                        self.drive("stop", distance=None, speed=0)  # Or move backward slightly if needed
-
-                    else:
-                        print("At the desired distance of 19 cm.")
-                        self.drive("stop", distance=None, speed=0)  # Stay still
-
+                    print("No line or ordinance detected.", end="\r")
+                    
         except KeyboardInterrupt:
             self.running = False
             print("Stopping autonomous navigation.")
